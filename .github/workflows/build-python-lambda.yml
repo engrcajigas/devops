@@ -1,0 +1,197 @@
+name: build python lambda
+on: 
+  workflow_call:
+    inputs:
+      working-dir:
+        required: false
+        type: string
+        default: "./"
+        description: "The working dir to work in"
+      project-name:
+        required: true
+        type: string
+        description: "The name of the project that owns the lambdas"
+      function-name:
+        required: true
+        type: string
+        description: "The function name"
+      python-version:
+        required: false
+        type: string
+        description: "The python version to use"
+        default: 3.8
+      build-tool:
+        required: false
+        type: string
+        description: "The python build-tool used for building, by default is pip"
+        default: pip
+      files-to-include:
+        required: false
+        type: string
+        description: "Add files, comma separated, to include in the zip package"
+      enable-tests:
+        required: false
+        type: boolean
+        description: "Enable or not the execution of tests"
+      requirements-file-location:
+        required: false
+        type: string
+        default: ""
+        description: "Custom location for the requirements.txt file"
+      test-command:
+        required: false
+        type: string
+        description: "The command you want to use to run the lambda tests"
+      enable-docs-tests:
+        required: false
+        type: boolean
+        default: false
+        description: "Enable or not the execution of python doctests"
+      docs-test-command:
+        required: false
+        type: string
+        default: python -m doctest *.py
+        description: "The command you want to use to run the lambda doctest"
+      enable-pep8-linter:
+        required: false
+        type: boolean
+        description: "Enable or not the execution of python pycodestyle (PEP8)"
+        default: false
+      enable-coverage-test:
+        required: false
+        type: boolean
+        description: "Enable or not the execution of python coverage test"
+        default: false
+      enable-code-artifact:
+        required: false
+        type: boolean 
+        default: false
+        description: "Enable or not the execution of codeartifact scripts"
+
+permissions:
+  id-token: write
+  contents: read   
+
+env:
+  LIBRARY_ARTIFACT_NAME: '${{ inputs.project-name }}.version'
+
+jobs:
+  build-python:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v3
+
+      - name: Getting SHA of last commit
+        id: get-sha
+        uses: bestseller-ecom/bestseller-github-actions/get-sha-commit@v1
+
+      - name: setup python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: ${{ inputs.build-tool }}
+
+
+      - name: Pre-build step
+        env:
+          IMAGE_TAG: ${{ steps.get-sha.outputs.sha_commit }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          cd ${{ inputs.working-dir }}
+          FILE="./custom_build/pre-build-step.sh"
+          if [ -f $FILE ]; then $FILE; else echo "$FILE doesn't exist. Skipping"; fi
+
+      - name: Including files to build dir
+        if: inputs.build-tool == 'pip'
+        env:
+          FILES: ${{ inputs.files-to-include }}
+        run: |
+          cd ${{ inputs.working-dir }}
+          mkdir -p target
+          if [ -f lambda_function.py ]; then cp lambda_function.py target; fi
+          if [ ! -z $FILES ]; then
+            IFS=',' read -r -a array <<< "$FILES"
+            for element in "${array[@]}"; do
+              cp -a "$element" target
+            done
+          fi
+        shell: bash
+   
+      - name: run pycodestyle
+        if: inputs.enable-pep8-linter == true
+        run: |
+          cd ${{ inputs.working-dir }}
+          pip install pycodestyle
+          python -m pycodestyle --exclude="*env*" --max-line-length=140 --count .
+
+      - name: Run code-artifact script
+        if: inputs.enable-code-artifact == true
+        run: if [ -f code-artifact-setup.sh ]; then ./code-artifact-setup.sh --build-stage; fi
+
+      - name: Install python dependencies (pip)
+        if: inputs.build-tool == 'pip'
+        run: |
+          cd ${{ inputs.working-dir }}
+          if [ "${{ inputs.requirements-file-location }}" != "" ]; then
+            REQ_FILE="${{ inputs.requirements-file-location }}/requirements.txt"
+          else
+            REQ_FILE="./requirements.txt"
+            echo "PYTHONPATH=target:${PYTHONPATH-}" >> $GITHUB_ENV
+          fi
+          python -m pip install --upgrade pip
+          for req in $(cat $REQ_FILE | grep -v -w boto |grep -v -w boto3 | grep -v -w botocore); do
+            pip install $req -t target --upgrade
+          done
+          if [ -f setup.py ]; then pip install . -t target; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f test_requirements.txt ]; then pip install -r test_requirements.txt; fi
+
+      - name: Running tests
+        if: inputs.build-tool == 'pip' && inputs.enable-tests == true
+        run: |
+          cd ${{ inputs.working-dir }}
+          if [ "${{ inputs.enable-docs-tests }}" == "true" ]; then
+            echo "Running doc tests"
+            ${{ inputs.docs-test-command }}          
+          fi          
+          echo "Running tests"
+          ${{ inputs.test-command }}
+        
+      - name: Run test coverage report
+        if: inputs.build-tool == 'pip' && inputs.enable-coverage-test == true
+        run:  |
+          cd ${{ inputs.working-dir }}
+          #python -m coverage html
+          python -m coverage report
+
+      - name: zip app bundle
+        if: inputs.build-tool == 'pip'
+        run: |
+          cd ${{ inputs.working-dir }}/target
+          zip -q -x "*.pyc" -x "*.egg*" -x "*dist-*" -x "*/__pycache__/*" -x "*boto" -x "*boto3" -r9 \
+            "${{ inputs.function-name }}-${{ steps.get-sha.outputs.sha_commit }}.zip" .
+
+      - name: Install dependecies (pipenv)
+        if: inputs.build-tool == 'pipenv'
+        run: |
+          cd ${{ inputs.working-dir }}
+          python -m pip install --upgrade pipenv wheel
+          pipenv install --dev
+
+      - name: Create zip package (pipenv)
+        if: inputs.build-tool == 'pipenv'
+        run: |
+          cd ${{ inputs.working-dir }}
+          pipenv run invoke package
+          mv target/*.zip target/${{ inputs.function-name }}-${{ steps.get-sha.outputs.sha_commit }}.zip
+
+      - name: Run tests with pipenv
+        if: inputs.build-tool == 'pipenv'
+        run: |
+          if [ "${{ inputs.enable-tests }}" == "true" ]; then
+            cd ${{ inputs.working-dir }}
+            pipenv run invoke test
+          else
+            echo "Skipping tests run as enable-test input is false"
+          fi
